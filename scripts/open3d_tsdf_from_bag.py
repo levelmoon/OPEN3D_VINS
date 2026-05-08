@@ -11,6 +11,11 @@ import rosbag
 import yaml
 from cv_bridge import CvBridge
 
+try:
+    import cv2
+except ImportError:
+    cv2 = None
+
 
 def quat_wxyz_to_rot(qw, qx, qy, qz):
     n = math.sqrt(qw * qw + qx * qx + qy * qy + qz * qz)
@@ -163,6 +168,84 @@ def apply_depth_limits(depth_cv, depth_scale, depth_min, depth_trunc):
     return np.ascontiguousarray(limited)
 
 
+def filter_depth_image(depth_cv, depth_scale, args):
+    filtered = depth_cv.copy()
+
+    if args.depth_border > 0:
+        border = args.depth_border
+        filtered[:border, :] = 0
+        filtered[-border:, :] = 0
+        filtered[:, :border] = 0
+        filtered[:, -border:] = 0
+
+    if args.depth_median_ksize > 1:
+        if cv2 is None:
+            raise RuntimeError("--depth-median-ksize requires opencv-python/cv2")
+        ksize = args.depth_median_ksize
+        if ksize % 2 == 0:
+            raise ValueError("--depth-median-ksize must be odd")
+        filtered = cv2.medianBlur(filtered, ksize)
+
+    if args.depth_min_neighbors > 0:
+        if cv2 is None:
+            raise RuntimeError("--depth-min-neighbors requires opencv-python/cv2")
+        valid = (filtered > 0).astype(np.uint8)
+        neighbor_count = cv2.filter2D(valid, -1, np.ones((3, 3), dtype=np.uint8), borderType=cv2.BORDER_CONSTANT)
+        filtered[neighbor_count < args.depth_min_neighbors] = 0
+
+    if args.depth_max_jump > 0:
+        depth_m = filtered.astype(np.float32)
+        if np.issubdtype(filtered.dtype, np.integer):
+            depth_m /= float(depth_scale)
+        valid = filtered > 0
+        edge = np.zeros(filtered.shape, dtype=bool)
+
+        diff = np.abs(depth_m[:, 1:] - depth_m[:, :-1])
+        pair_valid = valid[:, 1:] & valid[:, :-1]
+        jump = pair_valid & (diff > args.depth_max_jump)
+        edge[:, 1:] |= jump
+        edge[:, :-1] |= jump
+
+        diff = np.abs(depth_m[1:, :] - depth_m[:-1, :])
+        pair_valid = valid[1:, :] & valid[:-1, :]
+        jump = pair_valid & (diff > args.depth_max_jump)
+        edge[1:, :] |= jump
+        edge[:-1, :] |= jump
+        filtered[edge] = 0
+
+    return np.ascontiguousarray(filtered)
+
+
+def count_valid_depth(depth_cv):
+    return int(np.count_nonzero(np.isfinite(depth_cv) & (depth_cv > 0)))
+
+
+def crop_point_cloud(pcd, args):
+    bounds = [
+        (args.crop_x_min, args.crop_x_max),
+        (args.crop_y_min, args.crop_y_max),
+        (args.crop_z_min, args.crop_z_max),
+    ]
+    if all(lo is None and hi is None for lo, hi in bounds):
+        return pcd
+
+    points = np.asarray(pcd.points)
+    if len(points) == 0:
+        return pcd
+
+    mask = np.ones(len(points), dtype=bool)
+    for axis, (lo, hi) in enumerate(bounds):
+        if lo is not None:
+            mask &= points[:, axis] >= lo
+        if hi is not None:
+            mask &= points[:, axis] <= hi
+
+    before = len(points)
+    pcd = pcd.select_by_index(np.flatnonzero(mask).tolist())
+    print(f"crop filter: {before} -> {len(pcd.points)}")
+    return pcd
+
+
 def cleaned_point_cloud(pcd, args):
     pcd.remove_non_finite_points()
     print(f"raw points={len(pcd.points)}")
@@ -177,6 +260,8 @@ def cleaned_point_cloud(pcd, args):
 
     if args.no_filter:
         return pcd
+
+    pcd = crop_point_cloud(pcd, args)
 
     if args.stat_nb_neighbors > 0 and args.stat_std_ratio > 0:
         before = len(pcd.points)
@@ -260,7 +345,7 @@ def parse_rgb_color(text):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Fuse RealSense RGB-D rosbag and VINS trajectory into a PCD map.")
+    parser = argparse.ArgumentParser(description="Fuse raw depth rosbag and VINS trajectory into a height-colored PCD map.")
     parser.add_argument("--bag", required=True, help="Input rosbag path.")
     parser.add_argument("--traj", required=True, help="VINS trajectory: timestamp,px,py,pz,qw,qx,qy,qz,vx,vy,vz")
     parser.add_argument(
@@ -270,31 +355,40 @@ def main():
         help="Scale applied to trajectory timestamps. Use 1e-9 for nanoseconds, 1e-6 for microseconds, 1e-3 for milliseconds.",
     )
     parser.add_argument("--out", default="map.pcd", help="Output PCD path.")
-    parser.add_argument("--color-topic", default="/camera/color/image_raw")
-    parser.add_argument("--depth-topic", default="/camera/aligned_depth_to_color/image_raw")
-    parser.add_argument("--camera-info-topic", default="/camera/color/camera_info")
+    parser.add_argument("--depth-topic", default="/camera/depth/image_rect_raw")
+    parser.add_argument("--camera-info-topic", default="/camera/depth/camera_info")
     parser.add_argument("--body-t-cam", default=None, help="YAML containing 4x4 T_body_cam. Defaults to identity.")
     parser.add_argument("--voxel-length", type=float, default=0.03)
     parser.add_argument("--sdf-trunc", type=float, default=0.12)
     parser.add_argument("--depth-min", type=float, default=0.20)
-    parser.add_argument("--depth-trunc", type=float, default=4.0)
+    parser.add_argument("--depth-trunc", type=float, default=3.0)
     parser.add_argument("--depth-scale", type=float, default=1000.0)
+    parser.add_argument("--depth-median-ksize", type=int, default=1, help="Median filter kernel for raw depth. Use 1 to disable.")
+    parser.add_argument("--depth-min-neighbors", type=int, default=0, help="Drop depth pixels with fewer valid pixels in a 3x3 neighborhood. Use 0 to disable.")
+    parser.add_argument("--depth-max-jump", type=float, default=0.0, help="Drop pixels next to depth discontinuities larger than this many meters. Use 0 to disable.")
+    parser.add_argument("--depth-border", type=int, default=0, help="Drop this many pixels around the depth image border.")
+    parser.add_argument("--min-valid-depth-pixels", type=int, default=500, help="Skip a frame if fewer depth pixels remain after filtering.")
     parser.add_argument("--frame-stride", type=int, default=1)
-    parser.add_argument("--max-sync-dt", type=float, default=0.20)
     parser.add_argument("--max-pose-dt", type=float, default=0.20)
-    parser.add_argument("--pcd-voxel-downsample", type=float, default=0.01)
+    parser.add_argument("--pcd-voxel-downsample", type=float, default=0.03)
     parser.add_argument("--no-filter", action="store_true", help="Disable statistical/radius filtering.")
     parser.add_argument("--save-raw", action="store_true", help="Also save the unfiltered extracted point cloud.")
     parser.add_argument("--raw-out", default=None, help="Raw point cloud output path. Used only with --save-raw.")
     parser.add_argument("--stat-nb-neighbors", type=int, default=20)
-    parser.add_argument("--stat-std-ratio", type=float, default=1.5)
-    parser.add_argument("--radius-nb-points", type=int, default=6)
-    parser.add_argument("--radius", type=float, default=0.08)
+    parser.add_argument("--stat-std-ratio", type=float, default=1.0)
+    parser.add_argument("--radius-nb-points", type=int, default=12)
+    parser.add_argument("--radius", type=float, default=0.12)
+    parser.add_argument("--crop-x-min", type=float, default=None)
+    parser.add_argument("--crop-x-max", type=float, default=None)
+    parser.add_argument("--crop-y-min", type=float, default=None)
+    parser.add_argument("--crop-y-max", type=float, default=None)
+    parser.add_argument("--crop-z-min", type=float, default=None)
+    parser.add_argument("--crop-z-max", type=float, default=None)
     parser.add_argument(
         "--color-mode",
         choices=["rgb", "height", "uniform"],
         default="height",
-        help="Output coloring. rgb keeps camera color, height overwrites colors by height, uniform paints one color.",
+        help="Output coloring. height colors by height, uniform paints one color. rgb is kept for CLI compatibility and leaves the cloud unpainted.",
     )
     parser.add_argument("--height-axis", choices=["x", "y", "z"], default="z")
     parser.add_argument("--height-min", type=float, default=None)
@@ -312,25 +406,23 @@ def main():
     volume = o3d.pipelines.integration.ScalableTSDFVolume(
         voxel_length=args.voxel_length,
         sdf_trunc=args.sdf_trunc,
-        color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8,
+        color_type=o3d.pipelines.integration.TSDFVolumeColorType.NoColor,
     )
 
     bridge = CvBridge()
     intrinsic = None
-    latest_color = None
-    latest_depth = None
     integrated = 0
     skipped = 0
     seen_depth = 0
     printed_depth_debug = False
-    topic_counts = {args.color_topic: 0, args.depth_topic: 0, args.camera_info_topic: 0}
+    topic_counts = {args.depth_topic: 0, args.camera_info_topic: 0}
     skip_reasons = {
-        "missing_intrinsic_or_color": 0,
-        "color_depth_dt": 0,
+        "missing_intrinsic": 0,
         "pose_dt": 0,
+        "empty_depth": 0,
     }
 
-    topics = [args.color_topic, args.depth_topic, args.camera_info_topic]
+    topics = [args.depth_topic, args.camera_info_topic]
     with rosbag.Bag(args.bag, "r") as bag:
         print(f"bag time range: {bag.get_start_time():.6f} -> {bag.get_end_time():.6f}")
         available_topics = sorted(bag.get_type_and_topic_info().topics.keys())
@@ -352,38 +444,30 @@ def main():
                     print("camera intrinsic:", intrinsic.intrinsic_matrix)
                 continue
 
-            if topic == args.color_topic:
-                latest_color = msg
-                continue
-
             if topic != args.depth_topic:
                 continue
 
             seen_depth += 1
             if seen_depth % args.frame_stride != 0:
                 continue
-            if intrinsic is None or latest_color is None:
+            if intrinsic is None:
                 skipped += 1
-                skip_reasons["missing_intrinsic_or_color"] += 1
+                skip_reasons["missing_intrinsic"] += 1
                 continue
 
             depth_stamp = get_stamp(msg)
-            color_stamp = get_stamp(latest_color)
-            if abs(depth_stamp - color_stamp) > args.max_sync_dt:
-                skipped += 1
-                skip_reasons["color_depth_dt"] += 1
-                continue
-
             t_world_body, pose_dt = nearest_pose(traj_times, traj_poses, depth_stamp, args.max_pose_dt)
             if t_world_body is None:
                 skipped += 1
                 skip_reasons["pose_dt"] += 1
                 continue
 
-            color_cv = bridge.imgmsg_to_cv2(latest_color, desired_encoding="rgb8")
             depth_cv = bridge.imgmsg_to_cv2(msg, desired_encoding="passthrough")
             depth_cv = normalize_depth_image(depth_cv, msg.encoding)
             depth_cv = apply_depth_limits(depth_cv, args.depth_scale, args.depth_min, args.depth_trunc)
+            valid_before_filter = count_valid_depth(depth_cv)
+            depth_cv = filter_depth_image(depth_cv, args.depth_scale, args)
+            valid_after_filter = count_valid_depth(depth_cv)
             if not printed_depth_debug:
                 print(
                     "depth debug:",
@@ -393,10 +477,16 @@ def main():
                     f"contiguous={depth_cv.flags['C_CONTIGUOUS']}",
                     f"min={np.nanmin(depth_cv)}",
                     f"max={np.nanmax(depth_cv)}",
+                    f"valid_before_filter={valid_before_filter}",
+                    f"valid_after_filter={valid_after_filter}",
                 )
                 printed_depth_debug = True
+            if valid_after_filter < args.min_valid_depth_pixels:
+                skipped += 1
+                skip_reasons["empty_depth"] += 1
+                continue
 
-            color_o3d = o3d.geometry.Image(np.ascontiguousarray(color_cv))
+            color_o3d = o3d.geometry.Image(np.zeros((*depth_cv.shape, 3), dtype=np.uint8))
             depth_o3d = o3d.geometry.Image(depth_cv)
             rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
                 color_o3d,

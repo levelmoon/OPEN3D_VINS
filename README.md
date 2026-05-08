@@ -1,210 +1,262 @@
 # OPEN3D_VINS
 
-OPEN3D_VINS is a VINS-Fusion based visual-inertial localization and offline dense mapping project for UAV mapping workflows. The repository combines a GPU-accelerated VINS-Fusion fork, manual loop/relocalization changes, RealSense-oriented configuration, and Open3D/PCL scripts for generating PCD maps from rosbag data and optimized VINS trajectories.
+OPEN3D_VINS is a UAV visual-inertial localization and offline dense mapping workspace. It combines a GPU-oriented VINS-Fusion fork, FS-J200/D435i configuration, Open3D mapping scripts, and a DenseSurfelMapping based offline depth-only mapper.
 
-The current target platform is Jetson Orin NX with Ubuntu 20.04, ROS Noetic, JetPack 5.1.1, and a RealSense D435i/D435i-like RGB-D camera with IMU.
+The current validated mapping path is:
 
-## Main Features
+```text
+mapping_mavros.bag
+  + vio.txt or vio_loop.txt
+  + /camera/depth/image_rect_raw
+  + /camera/depth/camera_info
+  -> offline_surfel_from_bag
+  -> height-colored PCD
+```
 
-- GPU-accelerated VINS-Fusion frontend for stereo/RGB-D + IMU localization.
-- Manual prior loop/relocalization mode in `loop_fusion`.
-- `/vins_fusion/force_keyframe` service for forcing keyframe publication when the UAV is stationary.
-- Offline dense map generation from rosbag depth frames and VINS trajectories.
-- Open3D TSDF based PCD map generation with height coloring and filtering.
-- PCL-style depth stitching script retained as an alternative mapping path.
-- QGC/ground-station oriented coordinate design using `map -> odom_vins -> base_link`.
+This path does not run VINS during mapping, does not require RGB images, and does not use `aligned_depth_to_color`.
 
 ## Repository Layout
 
 ```text
 .
-├── vins-fusion-gpu/
-│   ├── camera_models/        # camera model package
-│   ├── vins_estimator/       # VINS estimator node and launch files
-│   ├── loop_fusion/          # loop closure and manual relocalization changes
-│   ├── config/FS-J200/       # RealSense/IMU configuration examples
-│   └── support_files/        # BRIEF vocabulary and reference files
-├── scripts/
-│   ├── open3d_tsdf_from_bag.py
-│   ├── open3d_tsdf_geometry_from_bag.py
-│   └── pcl_depth_stitch_from_bag.py
-├── pcd_analysis/             # generated map preview images
-├── map.pcd                   # example generated point cloud map
-└── *.md                      # design notes and current progress notes
+|-- DenseSurfelMapping/
+|   `-- DenseSurfelMapping/
+|       `-- surfel_fusion/
+|           |-- src/offline_surfel_from_bag.cpp
+|           |-- src/surfel_map.cpp
+|           |-- src/surfel_map.h
+|           |-- CMakeLists.txt
+|           `-- package.xml
+|-- vins-fusion-gpu/
+|   |-- vins_estimator/
+|   |-- loop_fusion/
+|   |-- camera_models/
+|   `-- config/FS-J200/
+|       |-- FS-J200_stereo_imu_config.yaml
+|       |-- left.yaml
+|       `-- right.yaml
+|-- scripts/
+|   |-- open3d_tsdf_from_bag.py
+|   |-- open3d_tsdf_geometry_from_bag.py
+|   `-- pcl_depth_stitch_from_bag.py
+|-- pcd_analysis/
+`-- README.md
 ```
+
+## Platform
+
+The tested target is:
+
+- Jetson Orin NX
+- Ubuntu 20.04
+- ROS Noetic
+- JetPack 5.1.1
+- Intel RealSense D435i
+- PX4/MAVROS IMU topic: `/mavros/imu/data`
 
 ## Dependencies
 
-Install the normal VINS-Fusion dependencies first:
+Install normal VINS-Fusion and ROS mapping dependencies:
 
 - ROS Noetic
 - Ceres Solver
 - Eigen
-- OpenCV with CUDA support, tested with OpenCV 4.x
-- rosbag, cv_bridge, image_transport, std_srvs
-- PCL / pcl_ros for PCD visualization
+- OpenCV
+- PCL and `pcl_ros`
+- `rosbag`
+- `cv_bridge`
+- `sensor_msgs`
+- `nav_msgs`
 
-For offline mapping scripts:
+For Open3D scripts:
 
 ```bash
 python3 -m pip install --user open3d numpy scipy pyyaml
 ```
 
-On Jetson/ROS systems, prefer `python3 -m pip install --user ...` and avoid mixing `sudo pip3` into the ROS Python environment.
+If using depth image cleanup options in `scripts/open3d_tsdf_from_bag.py`, also install OpenCV for Python:
+
+```bash
+python3 -m pip install --user opencv-python
+```
 
 ## Build
 
-Clone this repository into a catkin workspace:
+Place this repository in a catkin workspace and build:
 
 ```bash
-mkdir -p ~/catkin_ws/src
-cd ~/catkin_ws/src
-git clone https://github.com/levelmoon/OPEN3D_VINS.git
-cd ~/catkin_ws
+cd ~/FS-J200
 catkin_make
 source devel/setup.bash
 ```
 
-Before building, check the OpenCV path in:
+The offline surfel mapper target is:
 
 ```text
-vins-fusion-gpu/vins_estimator/CMakeLists.txt
-vins-fusion-gpu/loop_fusion/CMakeLists.txt
+surfel_fusion/offline_surfel_from_bag
 ```
 
-The GPU fork expects an OpenCV build with CUDA modules.
-
-## Run VINS-Fusion
-
-The included FS-J200 launch file starts `vins_node` with the RealSense-oriented config:
+If you change `offline_surfel_from_bag.cpp`, rebuild before running:
 
 ```bash
-roslaunch vins FS-J200.launch
+cd ~/FS-J200
+catkin_make --pkg surfel_fusion
+source devel/setup.bash
 ```
 
-Configuration entry point:
+## VINS Configuration
+
+The active FS-J200 configuration is:
 
 ```text
 vins-fusion-gpu/config/FS-J200/FS-J200_stereo_imu_config.yaml
 ```
 
-GPU-related parameters:
+Important settings:
 
 ```yaml
-use_gpu: 1
-use_gpu_acc_flow: 1
+imu_topic: "/mavros/imu/data"
+image0_topic: "/camera/infra1/image_rect_raw"
+image1_topic: "/camera/infra2/image_rect_raw"
+estimate_extrinsic: 0
 ```
 
-Set `use_gpu_acc_flow: 0` if other processes need more GPU resources.
-
-## Manual Relocalization
-
-The loop fusion code supports three modes after loading a historical pose graph:
-
-```text
-0: auto global loop
-1: manual prior loop
-2: hybrid manual prior + global fallback
-```
-
-Manual prior input format:
-
-```text
-x y yaw_deg radius yaw_radius_deg
-```
-
-Example:
-
-```text
--2.2 0 -87.777 2 45
-```
-
-The input is only a candidate search prior in the pose graph/map frame. The actual loop constraint still depends on BRIEF/BoW matching and geometric verification.
-
-When VINS does not automatically create a new keyframe, force the estimator to publish the current frame:
-
-```bash
-rosservice call /vins_fusion/force_keyframe "{}"
-```
-
-In `loop_fusion`, press:
-
-```text
-r
-```
-
-This triggers the forced keyframe path and attempts relocalization with the latest synchronized image, keyframe points, and pose.
-
-## Offline Dense Mapping
-
-The recommended mapping path is:
-
-```text
-rosbag
-  -> VINS-Fusion optimized trajectory
-  -> Open3D TSDF fusion
-  -> map.pcd / height-colored PCD
-```
-
-Example command:
-
-```bash
-python3 scripts/open3d_tsdf_from_bag.py \
-  --bag mapping.bag \
-  --traj vins_loop_optimized.txt \
-  --out map_height.pcd \
-  --depth-topic /camera/aligned_depth_to_color/image_raw \
-  --camera-info-topic /camera/color/camera_info \
-  --color-mode height \
-  --height-axis z
-```
-
-Expected trajectory format:
+The VINS trajectory files write IMU/body poses:
 
 ```text
 timestamp,px,py,pz,qw,qx,qy,qz,vx,vy,vz
 ```
 
-The script supports depth filtering, TSDF integration, voxel downsampling, statistical/radius outlier filtering, and height-based RGB coloring.
+Therefore the offline depth mapper uses:
 
-Visualize a generated PCD in RViz:
-
-```bash
-rosrun pcl_ros pcd_to_pointcloud map_height.pcd 1 _frame_id:=map
+```text
+T_world_depth = T_world_body * T_body_depth
 ```
 
-RViz settings:
+`T_body_depth` is resolved as follows:
+
+1. If the VINS yaml contains `body_T_depth`, use it directly.
+2. Otherwise read `body_T_cam0` and `body_T_cam1`, take the stereo center, then apply the depth camera offset relative to the stereo center.
+
+For the current D435i/PX4 setup, the validated depth offset is:
+
+```text
+T_stereoCenter_depth translation = [-0.025, 0, 0] meters
+```
+
+The resulting default `T_body_depth` from the current FS-J200 yaml is approximately:
+
+```text
+[  0.00474110   0.02964256   0.99954932   0.05966757
+  -0.99875350   0.04980785   0.00326023   0.02882350
+  -0.04968876  -0.99831884   0.02984176   0.04327493
+   0.00000000   0.00000000   0.00000000   1.00000000 ]
+```
+
+## Offline Depth-Only Surfel Mapping
+
+Recommended command:
+
+```bash
+rosrun surfel_fusion offline_surfel_from_bag \
+  --bag mapping_mavros.bag \
+  --traj vio_loop.txt \
+  --out map_surfel_final_test.pcd \
+  --depth-topic /camera/depth/image_rect_raw \
+  --camera-info-topic /camera/depth/camera_info \
+  --vins-config-yaml /home/nvidia/FS-J200/src/vins-fusion-gpu/config/FS-J200/FS-J200_stereo_imu_config.yaml \
+  --height-axis z \
+  --max-pose-dt 0.05 \
+  --max-angular-rate 0.3 \
+  --skip-first-sec 10.0 \
+  --skip-last-sec 5.0 \
+  --stereo-depth-tx -0.025 \
+  --stereo-depth-ty 0 \
+  --stereo-depth-tz 0 \
+  --trajectory-keep-radius 2.5 \
+  --density-voxel-size 0.20 \
+  --density-min-neighbors 4 \
+  --low-height-percentile 0.02 \
+  --low-height-margin 0.05
+```
+
+### What The Mapper Does
+
+- Reads raw depth from `/camera/depth/image_rect_raw`.
+- Reads depth intrinsics from `/camera/depth/camera_info`.
+- Reads VINS trajectory timestamps, including nanosecond timestamps.
+- Interpolates VINS poses to each depth frame timestamp.
+- Converts raw depth into meters.
+- Builds depth-derived grayscale images for surfel superpixels.
+- Applies `T_world_body * T_body_depth`.
+- Saves a height-colored PCD.
+
+### Noise Filtering
+
+Useful controls:
+
+```text
+--max-angular-rate 0.3
+--skip-first-sec 10.0
+--skip-last-sec 5.0
+--trajectory-keep-radius 2.5
+--density-voxel-size 0.20
+--density-min-neighbors 4
+--low-height-percentile 0.02
+--low-height-margin 0.05
+```
+
+`--trajectory-keep-radius` keeps only points near the VIO trajectory in the XY plane. This replaces hand-written polygon crop as the main ROI method.
+
+Manual crop options are still available for experiments:
+
+```text
+--crop-x-min / --crop-x-max
+--crop-y-min / --crop-y-max
+--crop-z-min / --crop-z-max
+--crop-polygon "x1,y1;x2,y2;x3,y3"
+```
+
+## Open3D TSDF Mapping
+
+The Open3D script is retained as an alternative mapping path:
+
+```bash
+python3 scripts/open3d_tsdf_from_bag.py \
+  --bag mapping_mavros.bag \
+  --traj vio_loop.txt \
+  --out map_open3d_height.pcd \
+  --depth-topic /camera/depth/image_rect_raw \
+  --camera-info-topic /camera/depth/camera_info \
+  --depth-trunc 3.0 \
+  --color-mode height \
+  --height-axis z
+```
+
+Use this path for quick TSDF experiments. Use `offline_surfel_from_bag` for the validated DenseSurfelMapping depth-only pipeline.
+
+## Visualizing PCD Output
+
+In RViz:
+
+```bash
+rosrun pcl_ros pcd_to_pointcloud map_surfel_final_test.pcd 1 _frame_id:=map
+```
+
+Recommended RViz settings:
 
 ```text
 Fixed Frame: map
 PointCloud2 Topic: /cloud_pcd
-Color Transformer: RGB8 / RGB
+Color Transformer: RGB8 or RGB
 ```
-
-## Coordinate Design
-
-The recommended online coordinate tree is:
-
-```text
-map
- |
- | T_map_odom, updated by loop/relocalization/manual prior
- |
-odom_vins
- |
- | T_odom_base, continuous VINS output
- |
-base_link
-```
-
-Flight control should use continuous `odom_vins -> base_link` odometry. Loop closure or relocalization should update `map -> odom_vins` for ground-station display, QGC integration, or task-level planning, rather than directly injecting discontinuous corrected poses into the flight-control loop.
 
 ## Notes
 
-- `map.pcd` and `pcd_analysis/` are example outputs for map inspection.
-- `scripts/pcl_depth_stitch_from_bag.py` is kept as an alternative PCL-style depth stitching implementation.
-- The original VINS-Fusion GPU README is preserved at `vins-fusion-gpu/READEME.md`.
-- Additional implementation notes are kept in the Chinese Markdown files at the repository root.
+- Do not use `/camera/aligned_depth_to_color/image_raw` for the validated surfel pipeline.
+- Do not require RGB frames for offline surfel mapping.
+- If the map is rotated incorrectly, first verify that the trajectory is an IMU/body trajectory and that the yaml path passed to `--vins-config-yaml` matches the VINS run that produced `vio_loop.txt`.
+- Generated PCD files, zip archives, and local preview images should not be committed unless they are intentionally used as small examples.
 
 ## License
 
