@@ -1,6 +1,6 @@
-# OPEN3D_VINS
+# VINS-Surfel-Mapper
 
-OPEN3D_VINS is a UAV visual-inertial localization and offline dense mapping workspace. It combines a GPU-oriented VINS-Fusion fork, FS-J200/D435i configuration, Open3D mapping scripts, and a DenseSurfelMapping based offline depth-only mapper.
+VINS-Surfel-Mapper is a UAV visual-inertial localization and offline dense mapping workspace. It combines a GPU-oriented VINS-Fusion fork, FS-J200/D435i configuration, Open3D mapping scripts, and a DenseSurfelMapping based offline depth-only mapper.
 
 The current validated mapping path is:
 
@@ -13,7 +13,7 @@ mapping_mavros.bag
   -> height-colored PCD
 ```
 
-This path does not run VINS during mapping, does not require RGB images, and does not use `aligned_depth_to_color`.
+This path does not run VINS during mapping. The Surfel mapper uses only raw depth images and depth camera intrinsics as image input; it does not read RGB/color images and does not use `aligned_depth_to_color`. The grayscale image required by the surfel superpixel stage is generated from the depth image itself.
 
 ## Repository Layout
 
@@ -184,10 +184,13 @@ rosrun surfel_fusion offline_surfel_from_bag \
 
 - Reads raw depth from `/camera/depth/image_rect_raw`.
 - Reads depth intrinsics from `/camera/depth/camera_info`.
+- Uses depth as the only image input to the Surfel pipeline.
+- Does not subscribe to color/RGB images.
+- Does not require `/camera/aligned_depth_to_color/image_raw`.
 - Reads VINS trajectory timestamps, including nanosecond timestamps.
 - Interpolates VINS poses to each depth frame timestamp.
 - Converts raw depth into meters.
-- Builds depth-derived grayscale images for surfel superpixels.
+- Builds depth-derived grayscale images for Surfel superpixels.
 - Applies `T_world_body * T_body_depth`.
 - Saves a height-colored PCD.
 
