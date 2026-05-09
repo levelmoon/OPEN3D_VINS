@@ -1,6 +1,6 @@
 # VINS-Surfel-Mapper
 
-VINS-Surfel-Mapper is a UAV visual-inertial localization and offline dense mapping workspace. It combines a GPU-oriented VINS-Fusion fork, FS-J200/D435i configuration, Open3D mapping scripts, and a DenseSurfelMapping based offline depth-only mapper.
+VINS-Surfel-Mapper is a UAV visual-inertial localization and offline dense mapping workspace. It combines a GPU-oriented VINS-Fusion fork, FS-J200/D435i configuration, and a DenseSurfelMapping based offline depth-only mapper.
 
 The current validated mapping path is:
 
@@ -25,6 +25,8 @@ This path does not run VINS during mapping. The Surfel mapper uses only raw dept
 |           |-- src/offline_surfel_from_bag.cpp
 |           |-- src/surfel_map.cpp
 |           |-- src/surfel_map.h
+|           |-- config/offline_surfel_from_bag.yaml
+|           |-- launch/offline_surfel_from_bag.launch
 |           |-- CMakeLists.txt
 |           `-- package.xml
 |-- vins-fusion-gpu/
@@ -36,8 +38,6 @@ This path does not run VINS during mapping. The Surfel mapper uses only raw dept
 |       |-- left.yaml
 |       `-- right.yaml
 |-- scripts/
-|   |-- open3d_tsdf_from_bag.py
-|   |-- open3d_tsdf_geometry_from_bag.py
 |   `-- pcl_depth_stitch_from_bag.py
 |-- pcd_analysis/
 `-- README.md
@@ -67,18 +67,6 @@ Install normal VINS-Fusion and ROS mapping dependencies:
 - `cv_bridge`
 - `sensor_msgs`
 - `nav_msgs`
-
-For Open3D scripts:
-
-```bash
-python3 -m pip install --user open3d numpy scipy pyyaml
-```
-
-If using depth image cleanup options in `scripts/open3d_tsdf_from_bag.py`, also install OpenCV for Python:
-
-```bash
-python3 -m pip install --user opencv-python
-```
 
 ## Build
 
@@ -158,26 +146,23 @@ The resulting default `T_body_depth` from the current FS-J200 yaml is approximat
 Recommended command:
 
 ```bash
-rosrun surfel_fusion offline_surfel_from_bag \
-  --bag mapping_mavros.bag \
-  --traj vio_loop.txt \
-  --out map_surfel_final_test.pcd \
-  --depth-topic /camera/depth/image_rect_raw \
-  --camera-info-topic /camera/depth/camera_info \
-  --vins-config-yaml /home/nvidia/FS-J200/src/vins-fusion-gpu/config/FS-J200/FS-J200_stereo_imu_config.yaml \
-  --height-axis z \
-  --max-pose-dt 0.05 \
-  --max-angular-rate 0.3 \
-  --skip-first-sec 10.0 \
-  --skip-last-sec 5.0 \
-  --stereo-depth-tx -0.025 \
-  --stereo-depth-ty 0 \
-  --stereo-depth-tz 0 \
-  --trajectory-keep-radius 2.5 \
-  --density-voxel-size 0.20 \
-  --density-min-neighbors 4 \
-  --low-height-percentile 0.02 \
-  --low-height-margin 0.05
+roslaunch surfel_fusion offline_surfel_from_bag.launch
+```
+
+All mapping parameters are in:
+
+```text
+DenseSurfelMapping/DenseSurfelMapping/surfel_fusion/config/offline_surfel_from_bag.yaml
+```
+
+Relative paths in this YAML are resolved from the `surfel_fusion` package directory. With the current Jetson workspace layout, bag, trajectory, and output files use paths such as `../../../levelmoon/vio_loop.txt`.
+
+The launch config also sets `shutdown_roslaunch_on_finish: true`, so a successful offline mapping run closes `roslaunch` after the PCD is saved.
+
+You can also launch with another config file:
+
+```bash
+roslaunch surfel_fusion offline_surfel_from_bag.launch config:=/path/to/offline_surfel_from_bag.yaml
 ```
 
 ### What The Mapper Does
@@ -219,24 +204,6 @@ Manual crop options are still available for experiments:
 --crop-z-min / --crop-z-max
 --crop-polygon "x1,y1;x2,y2;x3,y3"
 ```
-
-## Open3D TSDF Mapping
-
-The Open3D script is retained as an alternative mapping path:
-
-```bash
-python3 scripts/open3d_tsdf_from_bag.py \
-  --bag mapping_mavros.bag \
-  --traj vio_loop.txt \
-  --out map_open3d_height.pcd \
-  --depth-topic /camera/depth/image_rect_raw \
-  --camera-info-topic /camera/depth/camera_info \
-  --depth-trunc 3.0 \
-  --color-mode height \
-  --height-axis z
-```
-
-Use this path for quick TSDF experiments. Use `offline_surfel_from_bag` for the validated DenseSurfelMapping depth-only pipeline.
 
 ## Visualizing PCD Output
 

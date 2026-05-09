@@ -1,0 +1,35 @@
+bag: ../../../levelmoon/mapping_mavros.bag
+traj: ../../../levelmoon/vio_loop.txt
+out: ../../../levelmoon/map_surfel_final_test.pcd
+
+depth_topic: /camera/depth/image_rect_raw
+camera_info_topic: /camera/depth/camera_info
+vins_config_yaml: ../../vins-fusion-gpu/config/FS-J200/FS-J200_stereo_imu_config.yaml
+
+height_axis: z
+max_pose_dt: 0.05
+max_angular_rate: 0.3
+skip_first_sec: 10.0
+skip_last_sec: 5.0
+
+stereo_depth_tx: -0.025
+stereo_depth_ty: 0.0
+stereo_depth_tz: 0.0
+
+trajectory_keep_radius: 2.5
+density_voxel_size: 0.20
+density_min_neighbors: 4
+low_height_percentile: 0.02
+low_height_margin: 0.05
+remove_low_height_outliers: true
+shutdown_roslaunch_on_finish: true
+
+traj_time_scale: 0.0
+traj_time_offset: 0.0
+depth_scale: 1000.0
+fuse_near: 0.10
+fuse_far: 3.0
+frame_stride: 1
+max_frames: 0
+min_valid_depth_pixels: 500
+min_update_times: 5

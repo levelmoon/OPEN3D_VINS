@@ -10,9 +10,13 @@
 #include <string>
 #include <vector>
 
+#include <signal.h>
+#include <unistd.h>
+
 #include <Eigen/Eigen>
 #include <cv_bridge/cv_bridge.h>
 #include <ros/ros.h>
+#include <ros/package.h>
 #include <rosbag/bag.h>
 #include <rosbag/view.h>
 #include <sensor_msgs/CameraInfo.h>
@@ -23,15 +27,15 @@
 
 struct Args
 {
-    std::string bag;
-    std::string traj;
-    std::string out = "map_surfel_height.pcd";
+    std::string bag = "mapping_mavros.bag";
+    std::string traj = "vio_loop.txt";
+    std::string out = "map_surfel_final_test.pcd";
     std::string depth_topic = "/camera/depth/image_rect_raw";
     std::string camera_info_topic = "/camera/depth/camera_info";
     std::string height_axis = "z";
     double traj_time_scale = 0.0;
     double traj_time_offset = 0.0;
-    double max_pose_dt = 0.10;
+    double max_pose_dt = 0.05;
     double depth_scale = 1000.0;
     double fuse_near = 0.10;
     double fuse_far = 3.0;
@@ -41,12 +45,12 @@ struct Args
     int min_update_times = 5;
     double start_time = -std::numeric_limits<double>::infinity();
     double end_time = std::numeric_limits<double>::infinity();
-    double skip_first_sec = 0.0;
-    double skip_last_sec = 0.0;
+    double skip_first_sec = 10.0;
+    double skip_last_sec = 5.0;
     double min_camera_z = -std::numeric_limits<double>::infinity();
     double max_camera_z = std::numeric_limits<double>::infinity();
-    double max_angular_rate = std::numeric_limits<double>::infinity();
-    std::string vins_config_yaml;
+    double max_angular_rate = 0.3;
+    std::string vins_config_yaml = "../../vins-fusion-gpu/config/FS-J200/FS-J200_stereo_imu_config.yaml";
     double stereo_depth_tx = -0.025;
     double stereo_depth_ty = 0.0;
     double stereo_depth_tz = 0.0;
@@ -54,6 +58,7 @@ struct Args
     double density_voxel_size = 0.20;
     int density_min_neighbors = 4;
     bool remove_low_height_outliers = true;
+    bool shutdown_roslaunch_on_finish = false;
     double low_height_percentile = 0.02;
     double low_height_margin = 0.05;
     Eigen::Vector3f crop_min = Eigen::Vector3f(
@@ -96,13 +101,9 @@ static bool has_arg(int argc, char **argv, const std::string &name)
 static void print_usage()
 {
     std::cout
-        << "Usage: rosrun surfel_fusion offline_surfel_from_bag "
-        << "--bag mapping_mavros.bag --traj vio.txt --out map_surfel_height.pcd "
-        << "[--depth-topic /camera/depth/image_rect_raw] "
-        << "[--camera-info-topic /camera/depth/camera_info] "
-        << "[--vins-config-yaml FS-J200_stereo_imu_config.yaml] "
-        << "[--stereo-depth-tx -0.025] [--trajectory-keep-radius 2.5] "
-        << "[--keep-low-height-outliers]\n";
+        << "Usage: roslaunch surfel_fusion offline_surfel_from_bag.launch\n"
+        << "       rosrun surfel_fusion offline_surfel_from_bag [--bag mapping_mavros.bag] [--traj vio_loop.txt]\n"
+        << "Parameters are normally loaded from config/offline_surfel_from_bag.yaml.\n";
 }
 
 static bool parse_optional_double(int argc, char **argv, const std::string &name, double &target)
@@ -138,6 +139,75 @@ static std::vector<Eigen::Vector2f> parse_polygon(const std::string &text)
     return polygon;
 }
 
+static std::string resolve_package_relative_path(const std::string &path)
+{
+    if(path.empty())
+        return path;
+    if(path[0] == '/')
+        return path;
+
+    const std::string package_path = ros::package::getPath("surfel_fusion");
+    if(package_path.empty())
+        return path;
+    return package_path + "/" + path;
+}
+
+static void load_ros_params(Args &args)
+{
+    ros::NodeHandle nh("~");
+    nh.param<std::string>("bag", args.bag, args.bag);
+    nh.param<std::string>("traj", args.traj, args.traj);
+    nh.param<std::string>("out", args.out, args.out);
+    nh.param<std::string>("depth_topic", args.depth_topic, args.depth_topic);
+    nh.param<std::string>("camera_info_topic", args.camera_info_topic, args.camera_info_topic);
+    nh.param<std::string>("height_axis", args.height_axis, args.height_axis);
+    nh.param("traj_time_scale", args.traj_time_scale, args.traj_time_scale);
+    nh.param("traj_time_offset", args.traj_time_offset, args.traj_time_offset);
+    nh.param("max_pose_dt", args.max_pose_dt, args.max_pose_dt);
+    nh.param("depth_scale", args.depth_scale, args.depth_scale);
+    nh.param("fuse_near", args.fuse_near, args.fuse_near);
+    nh.param("fuse_far", args.fuse_far, args.fuse_far);
+    nh.param("frame_stride", args.frame_stride, args.frame_stride);
+    nh.param("max_frames", args.max_frames, args.max_frames);
+    nh.param("min_valid_depth_pixels", args.min_valid_depth_pixels, args.min_valid_depth_pixels);
+    nh.param("min_update_times", args.min_update_times, args.min_update_times);
+    nh.param("start_time", args.start_time, args.start_time);
+    nh.param("end_time", args.end_time, args.end_time);
+    nh.param("skip_first_sec", args.skip_first_sec, args.skip_first_sec);
+    nh.param("skip_last_sec", args.skip_last_sec, args.skip_last_sec);
+    nh.param("min_camera_z", args.min_camera_z, args.min_camera_z);
+    nh.param("max_camera_z", args.max_camera_z, args.max_camera_z);
+    nh.param("max_angular_rate", args.max_angular_rate, args.max_angular_rate);
+    nh.param<std::string>("vins_config_yaml", args.vins_config_yaml, args.vins_config_yaml);
+    nh.param("stereo_depth_tx", args.stereo_depth_tx, args.stereo_depth_tx);
+    nh.param("stereo_depth_ty", args.stereo_depth_ty, args.stereo_depth_ty);
+    nh.param("stereo_depth_tz", args.stereo_depth_tz, args.stereo_depth_tz);
+    nh.param("trajectory_keep_radius", args.trajectory_keep_radius, args.trajectory_keep_radius);
+    nh.param("density_voxel_size", args.density_voxel_size, args.density_voxel_size);
+    nh.param("density_min_neighbors", args.density_min_neighbors, args.density_min_neighbors);
+    nh.param("remove_low_height_outliers", args.remove_low_height_outliers, args.remove_low_height_outliers);
+    nh.param("shutdown_roslaunch_on_finish", args.shutdown_roslaunch_on_finish, args.shutdown_roslaunch_on_finish);
+    nh.param("low_height_percentile", args.low_height_percentile, args.low_height_percentile);
+    nh.param("low_height_margin", args.low_height_margin, args.low_height_margin);
+    std::string crop_polygon;
+    nh.param<std::string>("crop_polygon", crop_polygon, "");
+    if(!crop_polygon.empty())
+        args.crop_polygon = parse_polygon(crop_polygon);
+    double crop_value;
+    if(nh.getParam("crop_x_min", crop_value))
+        args.crop_min(0) = static_cast<float>(crop_value);
+    if(nh.getParam("crop_y_min", crop_value))
+        args.crop_min(1) = static_cast<float>(crop_value);
+    if(nh.getParam("crop_z_min", crop_value))
+        args.crop_min(2) = static_cast<float>(crop_value);
+    if(nh.getParam("crop_x_max", crop_value))
+        args.crop_max(0) = static_cast<float>(crop_value);
+    if(nh.getParam("crop_y_max", crop_value))
+        args.crop_max(1) = static_cast<float>(crop_value);
+    if(nh.getParam("crop_z_max", crop_value))
+        args.crop_max(2) = static_cast<float>(crop_value);
+}
+
 static Args parse_args(int argc, char **argv)
 {
     Args args;
@@ -147,8 +217,10 @@ static Args parse_args(int argc, char **argv)
         std::exit(0);
     }
 
-    args.bag = get_arg(argc, argv, "--bag");
-    args.traj = get_arg(argc, argv, "--traj");
+    load_ros_params(args);
+
+    args.bag = get_arg(argc, argv, "--bag", args.bag);
+    args.traj = get_arg(argc, argv, "--traj", args.traj);
     args.out = get_arg(argc, argv, "--out", args.out);
     args.depth_topic = get_arg(argc, argv, "--depth-topic", args.depth_topic);
     args.camera_info_topic = get_arg(argc, argv, "--camera-info-topic", args.camera_info_topic);
@@ -195,7 +267,7 @@ static Args parse_args(int argc, char **argv)
     parse_optional_double(argc, argv, "--min-camera-z", args.min_camera_z);
     parse_optional_double(argc, argv, "--max-camera-z", args.max_camera_z);
     parse_optional_double(argc, argv, "--max-angular-rate", args.max_angular_rate);
-    args.vins_config_yaml = get_arg(argc, argv, "--vins-config-yaml");
+    args.vins_config_yaml = get_arg(argc, argv, "--vins-config-yaml", args.vins_config_yaml);
     parse_optional_double(argc, argv, "--stereo-depth-tx", args.stereo_depth_tx);
     parse_optional_double(argc, argv, "--stereo-depth-ty", args.stereo_depth_ty);
     parse_optional_double(argc, argv, "--stereo-depth-tz", args.stereo_depth_tz);
@@ -204,7 +276,8 @@ static Args parse_args(int argc, char **argv)
     value = get_arg(argc, argv, "--density-min-neighbors");
     if(!value.empty())
         args.density_min_neighbors = std::stoi(value);
-    args.remove_low_height_outliers = !has_arg(argc, argv, "--keep-low-height-outliers");
+    if(has_arg(argc, argv, "--keep-low-height-outliers"))
+        args.remove_low_height_outliers = false;
     if(has_arg(argc, argv, "--remove-low-height-outliers"))
         args.remove_low_height_outliers = true;
     parse_optional_double(argc, argv, "--low-height-percentile", args.low_height_percentile);
@@ -222,7 +295,9 @@ static Args parse_args(int argc, char **argv)
         args.crop_max(1) = static_cast<float>(parsed_value);
     if(parse_optional_double(argc, argv, "--crop-z-max", parsed_value))
         args.crop_max(2) = static_cast<float>(parsed_value);
-    args.crop_polygon = parse_polygon(get_arg(argc, argv, "--crop-polygon"));
+    std::string crop_polygon = get_arg(argc, argv, "--crop-polygon");
+    if(!crop_polygon.empty())
+        args.crop_polygon = parse_polygon(crop_polygon);
 
     if(args.bag.empty() || args.traj.empty())
     {
@@ -243,6 +318,11 @@ static Args parse_args(int argc, char **argv)
         throw std::runtime_error("--low-height-percentile must be in [0, 0.5]");
     if(args.low_height_margin < 0.0)
         throw std::runtime_error("--low-height-margin must be >= 0");
+
+    args.bag = resolve_package_relative_path(args.bag);
+    args.traj = resolve_package_relative_path(args.traj);
+    args.out = resolve_package_relative_path(args.out);
+    args.vins_config_yaml = resolve_package_relative_path(args.vins_config_yaml);
 
     return args;
 }
@@ -710,6 +790,8 @@ int main(int argc, char **argv)
             args.min_update_times,
             filter_options);
         bag.close();
+        if(args.shutdown_roslaunch_on_finish)
+            kill(getppid(), SIGINT);
         return 0;
     }
     catch(const std::exception &e)

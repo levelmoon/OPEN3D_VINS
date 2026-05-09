@@ -1,0 +1,7 @@
+<launch>
+    <arg name="config" default="$(find surfel_fusion)/config/offline_surfel_from_bag.yaml" />
+
+    <node pkg="surfel_fusion" type="offline_surfel_from_bag" name="offline_surfel_from_bag" output="screen">
+        <rosparam command="load" file="$(arg config)" />
+    </node>
+</launch>
